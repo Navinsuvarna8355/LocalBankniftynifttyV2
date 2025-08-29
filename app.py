@@ -9,38 +9,54 @@ import math
 logging.basicConfig(level=logging.INFO)
 
 # --- Web Scraping and Calculation Functions ---
-def fetch_option_chain(symbol='BANKNIFTY'):
+def fetch_option_chain(symbol='BANKNIFTY', max_retries=3, delay=5):
     """
-    Fetches live option chain data from NSE with improved headers and session management.
+    Fetches live option chain data from NSE with improved headers and a retry mechanism.
+    
+    Args:
+        symbol (str): The stock index symbol (e.g., 'BANKNIFTY').
+        max_retries (int): Maximum number of retries for a failed request.
+        delay (int): Delay in seconds between retries.
     """
     url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     
     headers = {
+        'Accept': 'application/json, text/plain, */*',
         'Accept-Encoding': 'gzip, deflate, br',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Upgrade-Insecure-Requests': '1',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
         'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://www.nseindia.com/option-chain',
+        'Connection': 'keep-alive',
     }
     
     session = requests.Session()
     session.headers.update(headers)
     
-    try:
-        logging.info(f"Fetching cookies from NSE...")
-        # First request to get cookies
-        session.get("https://www.nseindia.com", timeout=10)
-        
-        logging.info(f"Fetching option chain for {symbol}...")
-        # Second request to fetch the option chain data
-        response = session.get(url, timeout=10)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        
-        logging.info("Data fetched successfully.")
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching data from NSE: {e}")
-        raise Exception(f"Failed to fetch data from NSE. Error: {e}")
+    for attempt in range(max_retries):
+        try:
+            # First request to get cookies from the home page
+            logging.info(f"Attempt {attempt + 1}: Fetching initial cookies from NSE...")
+            session.get("https://www.nseindia.com", timeout=10)
+            
+            # Second request to fetch the option chain data
+            logging.info(f"Attempt {attempt + 1}: Fetching option chain for {symbol}...")
+            response = session.get(url, timeout=10)
+            response.raise_for_status()
+            
+            # Try to parse JSON and return if successful
+            data = response.json()
+            logging.info("Data fetched and parsed successfully.")
+            return data
+            
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+            logging.error(f"Attempt {attempt + 1} failed for {symbol}: {e}")
+            if attempt < max_retries - 1:
+                logging.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                # If all retries fail, raise the final exception
+                raise Exception(f"Failed to fetch data after {max_retries} attempts. Error: {e}")
 
 def compute_oi_pcr_and_underlying(data):
     """
