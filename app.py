@@ -1,442 +1,419 @@
 # app.py
-# -*- coding: utf-8 -*-
-import sqlite3
-from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple, Optional
+# Requirements (Streamlit Cloud): streamlit==1.36.0, pandas, requests, altair
+# This is a single-file, production-ready multi-index OI dashboard.
 
 import streamlit as st
 import pandas as pd
-import requests
 import altair as alt
-from datetime import datetime, time as dtime
-import pytz
+import requests
+import time
+from datetime import datetime, timedelta
 
-# --------------------- Page config & custom CSS ---------------------
-st.set_page_config(page_title="BankNifty OI Dashboard", page_icon="📊", layout="wide")
-st.markdown("""
-<style>
-.block-container { padding-top: 0.75rem; padding-bottom: 1rem; }
-tbody tr:nth-child(even) { background-color: #f9f9f9 !important; }
-[data-testid="stMetricValue"] { font-size: 1.15rem; font-weight: 700; }
-hr { margin: 0.5rem 0 1rem 0; }
-</style>
-""", unsafe_allow_html=True)
+# --------------- CONFIG ---------------
+st.set_page_config(page_title="Multi-Index OI Dashboard", layout="wide")
+alt.themes.enable("opaque")
 
-# --------------------- Settings ---------------------
-IST = pytz.timezone("Asia/Kolkata")
-MARKET_OPEN = dtime(9, 0)
-MARKET_CLOSE = dtime(15, 30)
-INDEX_SYMBOL = "BANKNIFTY"
-NSE_OC_URL = f"https://www.nseindia.com/api/option-chain-indices?symbol={INDEX_SYMBOL}"
-DB_PATH = "trading_oi.db"
+INDICES = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 
-# --------------------- Time utils ---------------------
-def now_ist() -> datetime:
-    return datetime.now(IST)
+# Mapping to NSE "allIndices" names
+INDEX_NAME_MAP = {
+    "NIFTY": "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+    "FINNIFTY": "NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "NIFTY MIDCAP SELECT",
+}
 
-def within_market_hours() -> bool:
-    t = now_ist().time()
-    return MARKET_OPEN <= t <= MARKET_CLOSE
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                  " AppleWebKit/537.36 (KHTML, like Gecko)"
+                  " Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.nseindia.com/",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
 
-def fmt_ts_display(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+# --------------- HELPERS ---------------
+def ist_now():
+    # IST = UTC + 5:30
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
-def fmt_ts_store(dt: datetime) -> str:
-    # Store without timezone text to keep pandas parsing simple, we'll localize to IST on read
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+def market_open_ist(now=None):
+    # NSE equity hours: 09:15–15:30 IST, Mon–Fri
+    n = now or ist_now()
+    if n.weekday() >= 5:
+        return False
+    start = n.replace(hour=9, minute=15, second=0, microsecond=0)
+    end = n.replace(hour=15, minute=30, second=0, microsecond=0)
+    return start <= n <= end
 
-# --------------------- DB init ---------------------
-def init_db():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts_ist TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            strike INTEGER NOT NULL,
-            opt_type TEXT CHECK(opt_type IN ('CE','PE')) NOT NULL,
-            side TEXT CHECK(side IN ('BUY','SELL')) NOT NULL,
-            qty INTEGER NOT NULL,
-            price REAL NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS oi_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts_ist TEXT NOT NULL,
-            trading_day TEXT NOT NULL,
-            ce_oi REAL NOT NULL,
-            pe_oi REAL NOT NULL,
-            fut_price REAL
-        )
-    """)
-    con.commit()
-    return con
-
-CON = init_db()
-
-# --------------------- NSE fetch ---------------------
-def new_session() -> requests.Session:
+def get_session():
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.nseindia.com/",
-        "Connection": "keep-alive",
-    })
+    s.headers.update(NSE_HEADERS)
+    # Warm up cookies
     try:
-        s.get("https://www.nseindia.com", timeout=8)
+        s.get("https://www.nseindia.com/", timeout=8)
     except Exception:
         pass
     return s
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_option_chain() -> Dict[str, Any]:
-    r = new_session().get(NSE_OC_URL, timeout=10)
-    r.raise_for_status()
-    return r.json()
+def _retry_get_json(url, params=None, retries=3, backoff=0.75):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            s = get_session()
+            r = s.get(url, params=params, timeout=8)
+            if r.status_code == 200:
+                return r.json()
+            last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = repr(e)
+        time.sleep(backoff * (attempt + 1))
+    raise RuntimeError(f"Failed to fetch {url}: {last_err}")
 
-def parse_chain(js: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[float]]:
-    ce_rows, pe_rows = [], []
-    records = js.get("records", {}) or {}
-    data = records.get("data", []) or []
-    underlying = records.get("underlyingValue")
-    for rec in data:
-        strike = rec.get("strikePrice")
-        if not strike:
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_all_indices():
+    # Snapshot for tiles (LTP, change, %)
+    url = "https://www.nseindia.com/api/allIndices"
+    data = _retry_get_json(url)
+    if not isinstance(data, dict) or "data" not in data:
+        return {}
+    by_name = {}
+    for row in data.get("data", []):
+        name = row.get("index")
+        if not name:
             continue
-        ce = rec.get("CE")
-        pe = rec.get("PE")
-        if ce:
-            ce_rows.append((strike, ce.get("openInterest", 0), ce.get("lastPrice", None)))
-        if pe:
-            pe_rows.append((strike, pe.get("openInterest", 0), pe.get("lastPrice", None)))
-    ce_df = pd.DataFrame(ce_rows, columns=["Strike", "CE_OI", "CE_LTP"]).sort_values("Strike")
-    pe_df = pd.DataFrame(pe_rows, columns=["Strike", "PE_OI", "PE_LTP"]).sort_values("Strike")
-    return ce_df, pe_df, float(underlying) if underlying is not None else None
+        ltp = row.get("last", row.get("lastPrice", None))
+        change = row.get("variation", row.get("change", None))
+        pchange = row.get("percentChange", row.get("pChange", None))
+        by_name[name] = {
+            "ltp": ltp,
+            "change": change,
+            "pchange": pchange,
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "prevClose": row.get("previousClose", row.get("prevClose")),
+            "time": row.get("timeVal"),
+        }
+    return by_name
 
-# --------------------- Snapshots (intraday) ---------------------
-def record_snapshot(ce_sum: float, pe_sum: float, fut_price: Optional[float]):
-    CON.execute(
-        "INSERT INTO oi_snapshots (ts_ist, trading_day, ce_oi, pe_oi, fut_price) VALUES (?,?,?,?,?)",
-        (fmt_ts_store(now_ist()), fmt_ts_store(now_ist())[:10], ce_sum, pe_sum, fut_price if fut_price is not None else None)
-    )
-    CON.commit()
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_option_chain(symbol: str):
+    url = f"https://www.nseindia.com/api/option-chain-indices"
+    data = _retry_get_json(url, params={"symbol": symbol})
+    # Parse
+    rec = data.get("records", {})
+    under = rec.get("underlyingValue", None)
+    rows = rec.get("data", [])
+    parsed = []
+    for r in rows:
+        strike = r.get("strikePrice")
+        ce = r.get("CE")
+        pe = r.get("PE")
+        parsed.append({
+            "strike": strike,
+            "ce_oi": ce.get("openInterest") if ce else 0,
+            "pe_oi": pe.get("openInterest") if pe else 0,
+            "ce_chg_oi": ce.get("changeinOpenInterest") if ce else 0,
+            "pe_chg_oi": pe.get("changeinOpenInterest") if pe else 0,
+            "ce_ltp": ce.get("lastPrice") if ce else None,
+            "pe_ltp": pe.get("lastPrice") if pe else None,
+        })
+    df = pd.DataFrame(parsed).dropna(subset=["strike"])
+    df = df.sort_values("strike").reset_index(drop=True)
+    return under, df
 
-def load_snapshots() -> pd.DataFrame:
-    day = fmt_ts_store(now_ist())[:10]
-    df = pd.read_sql_query(
-        "SELECT * FROM oi_snapshots WHERE trading_day = ? ORDER BY id ASC",
-        CON, params=(day,)
-    )
-    if not df.empty:
-        # Localize to IST for consistent math with now_ist()
-        df["ts"] = pd.to_datetime(df["ts_ist"]).dt.tz_localize("Asia/Kolkata")
-    return df
+def compute_pcr(df: pd.DataFrame):
+    ce_sum = float(df["ce_oi"].sum() or 0)
+    pe_sum = float(df["pe_oi"].sum() or 0)
+    return (pe_sum / ce_sum) if ce_sum > 0 else None
 
-def maybe_snapshot(ce_sum: float, pe_sum: float, fut_price: Optional[float], gap_sec: int = 60):
-    if not within_market_hours():
-        return
-    df = load_snapshots()
+def compute_max_pain(df: pd.DataFrame):
+    # Approx max pain: sum OI * payoff distance at each candidate strike
+    strikes = df["strike"].astype(float).values
+    ce_oi = df["ce_oi"].astype(float).values
+    pe_oi = df["pe_oi"].astype(float).values
+    pains = []
+    for s in strikes:
+        call_pain = ((strikes - s).clip(min=0) * ce_oi).sum()
+        put_pain = ((s - strikes).clip(min=0) * pe_oi).sum()
+        pains.append(call_pain + put_pain)
+    if len(pains) == 0:
+        return None, None
+    idx_min = int(pd.Series(pains).idxmin())
+    return strikes[idx_min], pains[idx_min]
+
+def sr_levels(df: pd.DataFrame, k: int = 3):
+    # Supports: top-k PE OI strikes, Resistances: top-k CE OI strikes
+    top_pe = df.nlargest(k, "pe_oi")[["strike", "pe_oi"]]
+    top_ce = df.nlargest(k, "ce_oi")[["strike", "ce_oi"]]
+    return list(top_pe["strike"].astype(int)), list(top_ce["strike"].astype(int))
+
+def upsert_history(idx_key: str, ltp: float, max_points: int = 200):
+    if "hist" not in st.session_state:
+        st.session_state["hist"] = {}
+    hist = st.session_state["hist"].setdefault(idx_key, [])
+    now = ist_now()
+    # Append only if new or changed
+    if not hist or hist[-1][1] != ltp:
+        hist.append((now, float(ltp)))
+    # Trim
+    if len(hist) > max_points:
+        st.session_state["hist"][idx_key] = hist[-max_points:]
+
+def get_history_frame(indices):
+    # Build a tidy dataframe for sidebar compare
+    rows = []
+    for idx in indices:
+        for t, v in st.session_state.get("hist", {}).get(idx, []):
+            rows.append({"index": idx, "time": t, "ltp": v})
+    if not rows:
+        return pd.DataFrame(columns=["index", "time", "ltp"])
+    return pd.DataFrame(rows)
+
+def tag_new_levels(symbol: str, supports, resistances):
+    key = f"levels_{symbol}"
+    prev = st.session_state.get(key, {"supports": [], "resistances": []})
+    new_supports = [s for s in supports if s not in prev["supports"]]
+    new_resistances = [r for r in resistances if r not in prev["resistances"]]
+    st.session_state[key] = {"supports": supports, "resistances": resistances}
+    return new_supports, new_resistances
+
+def tiny_sparkline(df: pd.DataFrame):
     if df.empty:
-        record_snapshot(ce_sum, pe_sum, fut_price)
-        return
-    last_ts = df["ts"].iloc[-1]
-    if (now_ist() - last_ts).total_seconds() >= gap_sec:
-        record_snapshot(ce_sum, pe_sum, fut_price)
+        return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_line()
+    base = alt.Chart(df).encode(x=alt.X("time:T", axis=None), y=alt.Y("ltp:Q", axis=None))
+    line = base.mark_line(color="#6AA84F", strokeWidth=2)
+    area = base.mark_area(color="#6AA84F", opacity=0.15)
+    return (area + line).properties(height=40)
 
-# --------------------- Charts ---------------------
-def change_oi_chart(df: pd.DataFrame):
-    folded = df.melt(
-        id_vars=["ts", "fut_price"],
-        value_vars=["ce_change", "pe_change"],
-        var_name="Series",
-        value_name="Change"
-    )
-    oi_lines = (
-        alt.Chart(folded)
-        .mark_line()
-        .encode(
-            x=alt.X("ts:T", title="Time (IST)"),
-            y=alt.Y("Change:Q", axis=alt.Axis(title="Change in OI")),
-            color=alt.Color("Series:N", scale=alt.Scale(range=["#1f77b4", "#d62728"]), title=None),
-            tooltip=[alt.Tooltip("ts:T"), "Series:N", alt.Tooltip("Change:Q", format=",.0f")]
-        )
-    )
-    fut_line = (
-        alt.Chart(df)
-        .mark_line(strokeDash=[5, 3], color="black")
-        .encode(
-            x="ts:T",
-            y=alt.Y("fut_price:Q", axis=alt.Axis(title="Future price"))
-        )
-    )
-    return alt.layer(oi_lines, fut_line).resolve_scale(y="independent").properties(height=340).interactive()
+def crossover_points(df: pd.DataFrame, threshold_ratio=0.1):
+    # Mark strikes where CE and PE OI are close (potential crossovers)
+    # threshold = threshold_ratio * max(CE_OI, PE_OI) at that strike
+    if df.empty:
+        return pd.DataFrame(columns=["strike", "label"])
+    rows = []
+    for _, r in df.iterrows():
+        ce = float(r["ce_oi"] or 0)
+        pe = float(r["pe_oi"] or 0)
+        mx = max(ce, pe)
+        if mx == 0:
+            continue
+        if abs(ce - pe) <= threshold_ratio * mx:
+            rows.append({"strike": r["strike"], "label": "near crossover"})
+    return pd.DataFrame(rows)
 
-def total_oi_chart(df: pd.DataFrame):
-    folded = df.melt(
-        id_vars=["ts", "fut_price"],
-        value_vars=["ce_oi", "pe_oi"],
-        var_name="Series",
-        value_name="OI"
-    )
-    oi_lines = (
-        alt.Chart(folded)
-        .mark_line()
-        .encode(
-            x=alt.X("ts:T", title="Time (IST)"),
-            y=alt.Y("OI:Q", axis=alt.Axis(title="Total OI")),
-            color=alt.Color("Series:N", scale=alt.Scale(range=["#17becf", "#d62728"]), title=None),
-            tooltip=[alt.Tooltip("ts:T"), "Series:N", alt.Tooltip("OI:Q", format=",.0f")]
-        )
-    )
-    fut_line = (
-        alt.Chart(df)
-        .mark_line(strokeDash=[5, 3], color="black")
-        .encode(
-            x="ts:T",
-            y=alt.Y("fut_price:Q", axis=alt.Axis(title="Future price"))
-        )
-    )
-    return alt.layer(oi_lines, fut_line).resolve_scale(y="independent").properties(height=340).interactive()
+# --------------- UI: HEADER + GUARDS ---------------
+st.markdown("## Multi-index OI scanner")
+col_head_left, col_head_right = st.columns([0.7, 0.3])
+with col_head_left:
+    st.caption("Quickly scan NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY — switch instantly, watch OI structure and levels update in real time.")
+with col_head_right:
+    auto = st.toggle("Auto-refresh every 30s", value=True)
+    if auto:
+        st.experimental_set_query_params(ts=str(int(time.time())))  # bust cache on URL
+        st.autorefresh = st.empty()
+        st.autorefresh.write("")  # placeholder
 
-def oi_by_strike_chart(merged: pd.DataFrame):
-    tidy = merged.melt("Strike", var_name="Type", value_name="OpenInterest")
-    return (
-        alt.Chart(tidy)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("Strike:Q", title="Strike"),
-            y=alt.Y("OpenInterest:Q", title="Open Interest"),
-            color=alt.Color("Type:N", scale=alt.Scale(range=["#1f77b4", "#d62728"]), title=None),
-            tooltip=["Strike:Q", "Type:N", alt.Tooltip("OpenInterest:Q", format=",.0f")]
-        )
-        .properties(height=340)
-        .interactive()
-    )
+if not market_open_ist():
+    st.info("Market appears closed (IST). Data may be static or limited. You can still explore historical OI structure.")
 
-# --------------------- Crossover detection ---------------------
-@dataclass
-class Crossover:
-    strike_below: int
-    strike_above: int
-    note: str
-
-def find_ce_pe_crossover(merged: pd.DataFrame) -> List[Crossover]:
-    out: List[Crossover] = []
-    df = merged.sort_values("Strike").dropna(subset=["CE_OI", "PE_OI"]).copy()
-    df["diff"] = df["CE_OI"] - df["PE_OI"]
-    for i in range(1, len(df)):
-        prev, cur = df.iloc[i - 1], df.iloc[i]
-        if prev["diff"] == 0:
-            out.append(Crossover(int(prev["Strike"]), int(prev["Strike"]), "Equal OI at strike"))
-        elif prev["diff"] * cur["diff"] < 0:
-            out.append(Crossover(int(prev["Strike"]), int(cur["Strike"]), "Sign change between strikes"))
-    return out
-
-# --------------------- Trades & portfolio ---------------------
-def place_trade(symbol: str, strike: int, opt_type: str, side: str, qty: int, price: float):
-    CON.execute(
-        "INSERT INTO trades (ts_ist, symbol, strike, opt_type, side, qty, price) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (fmt_ts_store(now_ist()), symbol, strike, opt_type, side, qty, price)
-    )
-    CON.commit()
-
-def load_trades() -> pd.DataFrame:
-    return pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC", CON)
-
-def compute_positions(trades: pd.DataFrame) -> pd.DataFrame:
-    if trades.empty:
-        return pd.DataFrame(columns=["symbol", "strike", "opt_type", "net_qty", "avg_price", "invested"])
-    trades = trades.copy()
-    trades["signed_qty"] = trades.apply(lambda r: r["qty"] if r["side"] == "BUY" else -r["qty"], axis=1)
-
-    def agg(g: pd.DataFrame) -> pd.Series:
-        buy_qty = g.loc[g["signed_qty"] > 0, "signed_qty"].sum()
-        avg_price = ((g["price"] * g["signed_qty"].clip(lower=0)).sum() / buy_qty) if buy_qty else 0.0
-        return pd.Series({"net_qty": g["signed_qty"].sum(), "avg_price": avg_price})
-
-    grouped = trades.groupby(["symbol", "strike", "opt_type"], as_index=False).apply(agg).reset_index(drop=True)
-    grouped["invested"] = grouped["avg_price"] * grouped["net_qty"].clip(lower=0)
-    return grouped
-
-def enrich_mtm(pos: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame) -> pd.DataFrame:
-    if pos.empty:
-        return pos
-    latest = ce_df[["Strike", "CE_LTP"]].merge(pe_df[["Strike", "PE_LTP"]], on="Strike", how="outer")
-    pos = pos.merge(latest, left_on="strike", right_on="Strike", how="left")
-    pos["ltp"] = pos.apply(lambda r: r["CE_LTP"] if r["opt_type"] == "CE" else r["PE_LTP"], axis=1).fillna(0.0)
-    pos["mtm"] = (pos["ltp"] - pos["avg_price"]) * pos["net_qty"]
-    pos["pnl_pct"] = pos.apply(
-        lambda r: ((r["ltp"] - r["avg_price"]) / r["avg_price"] * 100) if r["avg_price"] else 0.0, axis=1
-    )
-    cols = ["symbol", "strike", "opt_type", "net_qty", "avg_price", "ltp", "mtm", "pnl_pct"]
-    return pos[cols].sort_values(["opt_type", "strike"])
-
-# --------------------- UI ---------------------
-st.title("📈 BankNifty OI Dashboard — TradingTick style")
-st.caption(f"🕒 Last updated: {fmt_ts_display(now_ist())}")
-if not within_market_hours():
-    st.warning("Market is closed (IST 9:00–15:30). Snapshots won't record; trading is disabled.")
-
-top_l, top_r = st.columns([1, 1])
-with top_l:
-    if st.button("🔄 Refresh (clear cache)", use_container_width=True):
-        st.cache_data.clear()
-with top_r:
-    snap_gap = st.slider("Snapshot min gap (seconds)", 30, 300, 60, 30, help="New snapshot only after this interval during market hours.")
-
-# Fetch option chain
+# --------------- SNAPSHOT TILES ---------------
+snap = {}
 try:
-    js = fetch_option_chain()
-    ce_df, pe_df, underlying = parse_chain(js)
-    merged = pd.merge(ce_df[["Strike", "CE_OI"]], pe_df[["Strike", "PE_OI"]], on="Strike", how="inner").sort_values("Strike")
-    ce_sum = float(ce_df["CE_OI"].sum()) if not ce_df.empty else 0.0
-    pe_sum = float(pe_df["PE_OI"].sum()) if not pe_df.empty else 0.0
-    fut_px = underlying
+    all_idx = fetch_all_indices()
 except Exception as e:
-    st.error(f"Option chain fetch failed: {e}")
-    # Fallback synthetic to keep UI responsive (no extra deps)
-    strikes = list(range(44000, 45500, 100))
-    ce_vals = [1_500_000 - i * 50_000 for i in range(len(strikes))]
-    pe_vals = [500_000 + i * 50_000 for i in range(len(strikes))]
-    ce_df = pd.DataFrame({"Strike": strikes, "CE_OI": ce_vals, "CE_LTP": [300 - i * 5 for i in range(len(strikes))]})
-    pe_df = pd.DataFrame({"Strike": strikes, "PE_OI": pe_vals, "PE_LTP": [120 + i * 5 for i in range(len(strikes))]})
-    merged = pd.merge(ce_df[["Strike", "CE_OI"]], pe_df[["Strike", "PE_OI"]], on="Strike", how="inner")
-    ce_sum, pe_sum, fut_px = float(sum(ce_vals)), float(sum(pe_vals)), None
+    st.warning(f"Index snapshot unavailable right now. Falling back to option-chain LTPs. ({e})")
+    all_idx = {}
 
-# Append snapshot (rate-limited)
-maybe_snapshot(ce_sum, pe_sum, fut_px, gap_sec=int(snap_gap))
-snap_df = load_snapshots()
+tile_cols = st.columns(len(INDICES))
+clicked = None
 
-# Tabs for clean layout
-tab1, tab2, tab3 = st.tabs(["📊 Intraday OI", "📈 OI by strike", "💼 Trading & portfolio"])
+for i, sym in enumerate(INDICES):
+    idx_name = INDEX_NAME_MAP.get(sym, sym)
+    dat = all_idx.get(idx_name, {})
+    ltp = dat.get("ltp")
+    change = dat.get("change")
+    pchg = dat.get("pchange")
 
-with tab1:
-    col1, col2 = st.columns(2, gap="large")
+    # Fallback to OC underlying if snapshot missing
+    if ltp is None:
+        try:
+            under, _ = fetch_option_chain(sym)
+            ltp = under
+        except Exception:
+            ltp = None
 
-    with col1:
-        st.markdown("#### 🔄 Change in OI (intraday)")
-        if snap_df.empty:
-            st.info("No snapshots yet. Wait for first capture during market hours.")
-        else:
-            base_ce, base_pe = snap_df["ce_oi"].iloc[0], snap_df["pe_oi"].iloc[0]
-            dfc = snap_df.copy()
-            dfc["ce_change"] = dfc["ce_oi"] - base_ce
-            dfc["pe_change"] = dfc["pe_oi"] - base_pe
-            # Bar summary (latest)
-            last_ce_chg, last_pe_chg = float(dfc["ce_change"].iloc[-1]), float(dfc["pe_change"].iloc[-1])
-            bar_df = pd.DataFrame({"Type": ["CALL", "PUT"], "Change": [last_ce_chg, last_pe_chg]})
-            bars = (
-                alt.Chart(bar_df)
-                .mark_bar()
-                .encode(
-                    x=alt.X("Type:N", title=None),
-                    y=alt.Y("Change:Q", title="Change in OI"),
-                    color=alt.Color("Type:N", scale=alt.Scale(range=["#1f77b4", "#d62728"]), legend=None),
-                    tooltip=[alt.Tooltip("Change:Q", format=",.0f")]
-                )
-                .properties(height=160)
-            )
-            st.altair_chart(bars, use_container_width=True)
-            st.altair_chart(change_oi_chart(dfc), use_container_width=True)
+    # Update history
+    if ltp is not None:
+        upsert_history(sym, float(ltp))
 
-    with col2:
-        st.markdown("#### 📊 Total OI")
-        if snap_df.empty:
-            st.info("No snapshots yet. Wait for first capture during market hours.")
-        else:
-            dft = snap_df.copy()
-            # Bar summary (latest totals)
-            bar2_df = pd.DataFrame({"Type": ["CALL", "PUT"], "Total": [float(dft["ce_oi"].iloc[-1]), float(dft["pe_oi"].iloc[-1]) ]})
-            bars2 = (
-                alt.Chart(bar2_df)
-                .mark_bar()
-                .encode(
-                    x=alt.X("Type:N", title=None),
-                    y=alt.Y("Total:Q", title="Total OI"),
-                    color=alt.Color("Type:N", scale=alt.Scale(range=["#17becf", "#d62728"]), legend=None),
-                    tooltip=[alt.Tooltip("Total:Q", format=",.0f")]
-                )
-                .properties(height=160)
-            )
-            st.altair_chart(bars2, use_container_width=True)
-            # Need ts for chart x-axis
-            dft["ts"] = dft["ts"]
-            st.altair_chart(total_oi_chart(dft), use_container_width=True)
-
-with tab2:
-    st.markdown("#### CE vs PE OI by strike")
-    st.altair_chart(oi_by_strike_chart(merged), use_container_width=True)
-    st.dataframe(
-        merged.rename(columns={"CE_OI": "CE OI", "PE_OI": "PE OI"}),
-        use_container_width=True, height=300
-    )
-    crosses = find_ce_pe_crossover(merged)
-    if crosses:
-        st.markdown("**Crossovers detected:**")
-        st.write("\n".join([f"- Between {c.strike_below} and {c.strike_above} ({c.note})" for c in crosses[:6]]))
-    else:
-        st.info("No CE/PE OI crossover detected in visible strikes.")
-
-with tab3:
-    left, right = st.columns([1, 2], gap="large")
-
-    with left:
-        st.markdown("#### 🎯 Trade panel")
-        strikes = merged["Strike"].tolist()
-        if not strikes:
-            st.info("No strikes available.")
-        else:
-            opt_type = st.selectbox("Option type", ["CE", "PE"], index=0)
-            strike = st.selectbox("Strike", strikes, index=len(strikes) // 2)
-            # LTP from CE_LTP / PE_LTP
-            if opt_type == "CE":
-                row = ce_df[ce_df["Strike"] == strike]
-                sel_price = float(row["CE_LTP"].iloc[0]) if not row.empty and pd.notna(row["CE_LTP"].iloc[0]) else 0.0
-            else:
-                row = pe_df[pe_df["Strike"] == strike]
-                sel_price = float(row["PE_LTP"].iloc[0]) if not row.empty and pd.notna(row["PE_LTP"].iloc[0]) else 0.0
-            st.metric("Current LTP", f"{sel_price:.2f}")
-            qty = st.number_input("Quantity", min_value=1, max_value=2000, step=25, value=25)
-            disable_trading = not within_market_hours()
-            c1, c2 = st.columns(2)
+    with tile_cols[i]:
+        with st.container(border=True):
+            c1, c2 = st.columns([0.55, 0.45])
             with c1:
-                if st.button("Buy", type="primary", disabled=disable_trading or sel_price == 0.0, use_container_width=True):
-                    place_trade(INDEX_SYMBOL, int(strike), opt_type, "BUY", int(qty), sel_price)
-                    st.success(f"BUY {opt_type} {strike} x {qty} @ {sel_price:.2f}")
+                st.markdown(f"**{sym}**")
+                st.markdown(f"{(ltp if ltp is not None else '—')}")
+                if change is not None and pchg is not None:
+                    color = "🟢" if float(change) >= 0 else "🔻"
+                    st.caption(f"{color} {change:+.2f} ({pchg:+.2f}%)")
+                else:
+                    st.caption("—")
             with c2:
-                if st.button("Sell", disabled=disable_trading or sel_price == 0.0, use_container_width=True):
-                    place_trade(INDEX_SYMBOL, int(strike), opt_type, "SELL", int(qty), sel_price)
-                    st.success(f"SELL {opt_type} {strike} x {qty} @ {sel_price:.2f}")
-            if disable_trading:
-                st.caption("Trading disabled outside IST 9:00–15:30.")
+                hist_df = get_history_frame([sym])
+                spark = tiny_sparkline(hist_df[hist_df["index"] == sym])
+                st.altair_chart(spark, use_container_width=True)
 
-    with right:
-        st.markdown("#### 💼 Portfolio")
-        trades_df = load_trades()
-        positions = enrich_mtm(compute_positions(trades_df), ce_df, pe_df)
-        if positions.empty:
-            st.info("No open positions.")
-        else:
-            styled = positions.style.format({
-                "avg_price": "{:.2f}", "ltp": "{:.2f}", "mtm": "{:.2f}", "pnl_pct": "{:.2f}%"
-            })
-            st.dataframe(styled, use_container_width=True)
-            total_mtm = float(positions["mtm"].sum())
-            total_invested = float((positions["avg_price"] * positions["net_qty"].clip(lower=0)).sum())
-            pnl_pct = (total_mtm / total_invested * 100) if total_invested else 0.0
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total MTM", f"{total_mtm:,.2f}")
-            m2.metric("Invested (approx)", f"{total_invested:,.2f}")
-            m3.metric("PnL %", f"{pnl_pct:.2f}%")
+            if st.button("Open", key=f"btn_{sym}", use_container_width=True):
+                clicked = sym
 
-        st.markdown("#### 📝 Transaction history")
-        if trades_df.empty:
-            st.info("No trades yet.")
-        else:
-            st.dataframe(trades_df, use_container_width=True, height=320)
+# --------------- SELECTED SYMBOL ---------------
+selected = clicked or st.session_state.get("symbol_choice", "BANKNIFTY")
+st.session_state["symbol_choice"] = selected
 
-st.caption("Single-file. Data cached 60s. Snapshots append during market hours. Source: NSE option chain (indices).")
+st.markdown("---")
+st.subheader(f"Detailed view: {selected}")
+
+# --------------- FETCH OC DATA ---------------
+try:
+    underlying, oc_df = fetch_option_chain(selected)
+except Exception as e:
+    st.error(f"Option chain unavailable for {selected} right now. Try again shortly. ({e})")
+    st.stop()
+
+if underlying is not None:
+    st.caption(f"Underlying: {underlying:.2f}")
+
+# --------------- TABS ---------------
+tab1, tab2, tab3 = st.tabs(["CE vs PE OI", "Change in OI", "Max Pain • PCR • Levels"])
+
+# Tab 1: CE vs PE OI + crossover markers + underlying vline
+with tab1:
+    if oc_df.empty:
+        st.write("No option data.")
+    else:
+        long_df = oc_df.melt(
+            id_vars=["strike"],
+            value_vars=["ce_oi", "pe_oi"],
+            var_name="type",
+            value_name="oi",
+        )
+        long_df["type"] = long_df["type"].map({"ce_oi": "CE OI", "pe_oi": "PE OI"})
+
+        base = alt.Chart(long_df).encode(
+            x=alt.X("strike:Q", title="Strike"),
+            y=alt.Y("oi:Q", title="Open Interest"),
+            color=alt.Color("type:N", scale=alt.Scale(range=["#FF8C42", "#3B82F6"])),
+            tooltip=[
+                alt.Tooltip("strike:Q", title="Strike"),
+                alt.Tooltip("type:N", title="Type"),
+                alt.Tooltip("oi:Q", title="OI", format=","),
+            ],
+        )
+
+        bars = base.mark_bar(size=8)
+        chart = bars
+
+        # Underlying vertical line
+        if underlying:
+            vline = alt.Chart(pd.DataFrame({"x": [underlying]})).mark_rule(
+                color="#22C55E", strokeWidth=2
+            ).encode(x="x:Q")
+            chart = chart + vline
+
+        # Crossover markers
+        cross_df = crossover_points(oc_df)
+        if not cross_df.empty:
+            cross_mark = alt.Chart(cross_df).mark_point(
+                shape="triangle-up", color="#6366F1", size=80
+            ).encode(x="strike:Q", y=alt.value(0))
+            chart = chart + cross_mark
+
+        st.altair_chart(chart.properties(height=380), use_container_width=True)
+
+# Tab 2: Change in OI intraday
+with tab2:
+    if oc_df.empty:
+        st.write("No option data.")
+    else:
+        delta_df = oc_df.melt(
+            id_vars=["strike"],
+            value_vars=["ce_chg_oi", "pe_chg_oi"],
+            var_name="type",
+            value_name="chg_oi",
+        )
+        delta_df["type"] = delta_df["type"].map({"ce_chg_oi": "CE ΔOI", "pe_chg_oi": "PE ΔOI"})
+
+        base = alt.Chart(delta_df).encode(
+            x=alt.X("strike:Q", title="Strike"),
+            y=alt.Y("chg_oi:Q", title="Change in OI"),
+            color=alt.Color("type:N", scale=alt.Scale(range=["#F59E0B", "#60A5FA"])),
+            tooltip=[
+                alt.Tooltip("strike:Q", title="Strike"),
+                alt.Tooltip("type:N", title="Type"),
+                alt.Tooltip("chg_oi:Q", title="Δ OI", format=","),
+            ],
+        )
+        bars = base.mark_bar(size=8)
+        hzero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#9CA3AF").encode(y="y:Q")
+        st.altair_chart((bars + hzero).properties(height=300), use_container_width=True)
+
+# Tab 3: Max Pain, PCR, Support/Resistance with NEW tags
+with tab3:
+    c1, c2, c3 = st.columns([0.3, 0.35, 0.35])
+
+    with c1:
+        pcr = compute_pcr(oc_df)
+        mp_strike, _ = compute_max_pain(oc_df)
+        st.markdown("**Summary:**")
+        st.metric("PCR (Total OI)", f"{pcr:.2f}" if pcr else "—")
+        st.metric("Max Pain", f"{int(mp_strike)}" if mp_strike else "—")
+        if underlying and mp_strike:
+            diff = underlying - mp_strike
+            st.caption(f"Distance to Max Pain: {diff:+.0f}")
+
+    with c2:
+        sup, res = sr_levels(oc_df, k=3)
+        new_sup, new_res = tag_new_levels(selected, sup, res)
+        st.markdown("**Support (Top PE OI):**")
+        for s in sup:
+            tag = " 🆕" if s in new_sup else ""
+            st.write(f"- {s}{tag}")
+    with c3:
+        st.markdown("**Resistance (Top CE OI):**")
+        for r in res:
+            tag = " 🆕" if r in new_res else ""
+            st.write(f"- {r}{tag}")
+
+# --------------- SIDEBAR: QUICK COMPARE ---------------
+st.sidebar.header("Quick compare")
+hist_all = get_history_frame(INDICES)
+if hist_all.empty:
+    st.sidebar.caption("Waiting for snapshot to build.")
+else:
+    # Normalize times so Altair treats as continuous
+    chart = alt.Chart(hist_all).mark_line().encode(
+        x=alt.X("time:T", title=None),
+        y=alt.Y("ltp:Q", title=None),
+        color=alt.Color("index:N", legend=alt.Legend(orient="bottom", title=None)),
+        tooltip=[alt.Tooltip("index:N"), alt.Tooltip("time:T"), alt.Tooltip("ltp:Q")],
+    ).properties(height=180)
+    st.sidebar.altair_chart(chart, use_container_width=True)
+
+# --------------- FOOTER + REFRESH ---------------
+with st.sidebar.expander("Settings"):
+    st.caption("History length per index")
+    max_points = st.slider("Max points", 50, 500, 200, 10)
+    # Enforce max_points (trim)
+    if "hist" in st.session_state:
+        for k in list(st.session_state["hist"].keys()):
+            h = st.session_state["hist"][k]
+            if len(h) > max_points:
+                st.session_state["hist"][k] = h[-max_points:]
+
+st.caption("Data: NSE public endpoints. If data stalls, it usually recovers on the next refresh window.")
+
+# Auto-refresh every 30s (soft)
+if auto:
+    st.experimental_rerun()
