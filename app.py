@@ -1,19 +1,12 @@
-# app.py — Single-file Streamlit Paper Trading App
-# Features:
-# - Simulated price feed (random walk)
-# - Buy/Sell with balance, portfolio value, and transaction history (SQLite)
-# - NSE Option Chain fetch with headers + cookie warm-up, cached
-# - Per-user via User ID field; SQLite persistence
-# - Minimal deps: streamlit, requests (sqlite3 in stdlib)
+# app.py — Single-file Streamlit Paper Trading App with Market-Hour Guard
 
 import os
 import time
 import uuid
-import json
 import random
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, time as dtime
 import requests
 import streamlit as st
 
@@ -51,11 +44,13 @@ def get_db():
             price REAL NOT NULL,
             ts INTEGER NOT NULL
         )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user ON trades(user_id)")
     return conn
 
 conn = get_db()
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def ensure_user(uid, starting_balance=STARTING_BALANCE):
     with db_lock:
         r = conn.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
@@ -93,6 +88,13 @@ def fetch_history(uid, limit=200):
     rows = conn.execute("SELECT id, side, qty, price, ts FROM trades WHERE user_id=? ORDER BY id DESC LIMIT ?",
                         (uid, limit)).fetchall()
     return [dict(r) for r in rows]
+
+# ----------------------------
+# Market-hour guard
+# ----------------------------
+def is_market_open():
+    now_ist = datetime.now()  # Assumes server is in IST
+    return dtime(9, 0) <= now_ist.time() <= dtime(15, 30)
 
 # ----------------------------
 # Simulated price
@@ -161,9 +163,8 @@ def inr(x):
 # ----------------------------
 # UI
 # ----------------------------
-st.title("📈 Paper Trading App")
+st.title("📈 Paper Trading App (Market Hours Guard)")
 
-# Session user id default
 if "uid" not in st.session_state:
     st.session_state.uid = str(uuid.uuid4())
 
@@ -186,9 +187,9 @@ with st.sidebar:
 
 ensure_user(st.session_state.uid, STARTING_BALANCE)
 
-# Price & portfolio metrics
 last_price = step_price()
-qty, bal, pv = get_net_qty(st.session_state.uid), get_balance(st.session_state.uid), get_balance(st.session_state.uid) + get_net_qty(st.session_state.uid) * last_price
+qty, bal = get_net_qty(st.session_state.uid), get_balance(st.session_state.uid)
+pv = bal + qty * last_price
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("User ID", st.session_state.uid[-12:])
@@ -196,15 +197,20 @@ m2.metric("Balance", inr(bal))
 m3.metric("Shares held", f"{qty}")
 m4.metric("Portfolio value", inr(pv))
 
-# Price chart
 st.subheader("Price chart")
 if st.session_state.price_series:
     st.line_chart({"Price": [p for _, p in st.session_state.price_series]}, height=180)
 else:
     st.info("Starting price stream…")
 
-# Trade panel
+# ----------------------------
+# Trading panel with guard
+# ----------------------------
 st.subheader("Trade")
 col1, col2, col3 = st.columns([1, 1, 6])
 with col1:
-    qty_in = st
+    qty_in = st.number_input("Qty", min_value=1, value=1, step=1)
+with col2:
+    if st.button("BUY"):
+        if is_market_open():
+            insert_trade(st.session_state.uid, "BUY", qty_in, last
