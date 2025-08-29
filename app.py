@@ -11,7 +11,8 @@ logging.basicConfig(level=logging.INFO)
 # --- Web Scraping and Calculation Functions ---
 def fetch_option_chain(symbol='BANKNIFTY', max_retries=3, delay=5):
     """
-    Fetches live option chain data from NSE with improved headers and a retry mechanism.
+    Fetches live option chain data from NSE with improved headers and a retry mechanism
+    that first establishes a session.
     
     Args:
         symbol (str): The stock index symbol (e.g., 'BANKNIFTY').
@@ -28,6 +29,7 @@ def fetch_option_chain(symbol='BANKNIFTY', max_retries=3, delay=5):
         'X-Requested-With': 'XMLHttpRequest',
         'Referer': 'https://www.nseindia.com/option-chain',
         'Connection': 'keep-alive',
+        'Host': 'www.nseindia.com',
     }
     
     session = requests.Session()
@@ -35,16 +37,15 @@ def fetch_option_chain(symbol='BANKNIFTY', max_retries=3, delay=5):
     
     for attempt in range(max_retries):
         try:
-            # First request to get cookies from the home page
-            logging.info(f"Attempt {attempt + 1}: Fetching initial cookies from NSE...")
+            # Step 1: Establish a session and get cookies from the home page
+            logging.info(f"Attempt {attempt + 1}: Establishing session with NSE...")
             session.get("https://www.nseindia.com", timeout=10)
             
-            # Second request to fetch the option chain data
+            # Step 2: Use the same session to fetch the option chain data
             logging.info(f"Attempt {attempt + 1}: Fetching option chain for {symbol}...")
             response = session.get(url, timeout=10)
-            response.raise_for_status()
+            response.raise_for_status()  # Raise exception for bad status codes
             
-            # Try to parse JSON and return if successful
             data = response.json()
             logging.info("Data fetched and parsed successfully.")
             return data
@@ -55,7 +56,6 @@ def fetch_option_chain(symbol='BANKNIFTY', max_retries=3, delay=5):
                 logging.info(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
             else:
-                # If all retries fail, raise the final exception
                 raise Exception(f"Failed to fetch data after {max_retries} attempts. Error: {e}")
 
 def compute_oi_pcr_and_underlying(data):
