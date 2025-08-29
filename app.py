@@ -9,18 +9,16 @@ import math
 logging.basicConfig(level=logging.INFO)
 
 # --- Web Scraping and Calculation Functions ---
-def fetch_option_chain(symbol='BANKNIFTY', max_retries=5, delay=5):
+def fetch_data_from_url(url, max_retries=5, delay=5):
     """
-    Fetches live option chain data from NSE using a requests.Session to maintain state
+    Fetches data from a given URL using a requests.Session to maintain state
     and bypass security measures.
     
     Args:
-        symbol (str): The stock index symbol (e.g., 'BANKNIFTY').
+        url (str): The URL to fetch data from.
         max_retries (int): Maximum number of retries for a failed request.
         delay (int): Delay in seconds between retries.
     """
-    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-    
     headers = {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -38,13 +36,11 @@ def fetch_option_chain(symbol='BANKNIFTY', max_retries=5, delay=5):
     for attempt in range(max_retries):
         try:
             # Step 1: Establish a session and get cookies from the home page.
-            # This is a crucial step to mimic a real user and get valid cookies.
             logging.info(f"Attempt {attempt + 1}: Establishing session with NSE home page...")
             session.get("https://www.nseindia.com", timeout=10)
             
-            # Step 2: Use the same session to fetch the option chain data.
-            # The session automatically sends the cookies it just received.
-            logging.info(f"Attempt {attempt + 1}: Fetching option chain for {symbol}...")
+            # Step 2: Use the same session to fetch the data.
+            logging.info(f"Attempt {attempt + 1}: Fetching data from {url}...")
             response = session.get(url, timeout=10)
             response.raise_for_status()  # Raise exception for bad status codes
             
@@ -53,7 +49,7 @@ def fetch_option_chain(symbol='BANKNIFTY', max_retries=5, delay=5):
             return data
             
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            logging.error(f"Attempt {attempt + 1} failed for {symbol}: {e}")
+            logging.error(f"Attempt {attempt + 1} failed for {url}: {e}")
             if attempt < max_retries - 1:
                 logging.info(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
@@ -99,6 +95,17 @@ def compute_oi_pcr_and_underlying(data):
         'expiry': current_expiry
     }
 
+def fetch_india_vix():
+    """Fetches India VIX data from NSE and handles errors gracefully."""
+    vix_url = "https://www.nseindia.com/api/option-chain-indices?symbol=INDIAVIX"
+    try:
+        data = fetch_data_from_url(vix_url, max_retries=3, delay=5)
+        if data and 'records' in data and 'underlyingValue' in data['records']:
+            return data['records']['underlyingValue']
+    except Exception as e:
+        logging.error(f"Error fetching India VIX data: {e}")
+    return 0.0
+
 def determine_signal(pcr, trend, ema_signal):
     """
     Based on PCR, trend and EMA signal, determines the final trading signal.
@@ -124,16 +131,25 @@ def display_dashboard():
     symbol_choice = st.session_state.symbol
     info = st.session_state.info
     
-    st.header(f"{symbol_choice} Live Analysis")
-    st.divider()
-
-    col1, col2, col3 = st.columns(3)
+    st.header(f"{symbol_choice} Option Chain Dashboard")
+    
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Live Price", f"₹ {info['underlying']:.2f}")
     with col2:
-        st.metric("Total PCR", f"{info['pcr_total']:.2f}")
+        st.metric("PCR", f"{info['pcr_near']:.2f}")
     with col3:
-        st.metric("Near PCR", f"{info['pcr_near']:.2f}")
+        st.metric("Trend", "BULLISH" if info['pcr_near'] >= 1 else "BEARISH")
+    with col4:
+        st.metric("India VIX", f"{info['vix']:.2f}", help="India VIX is not available on holidays.")
+
+    st.subheader("Market Volatility Advice")
+    if info['vix'] > 20:
+        st.warning("High volatility. Trade with caution.")
+    elif info['vix'] > 15:
+        st.info("Moderate volatility. Watch for breakouts.")
+    else:
+        st.success("Low volatility. Possible sideways market.")
 
     st.subheader("Strategy Signal")
     
@@ -153,9 +169,6 @@ def display_dashboard():
     
     signal, suggested_side = determine_signal(pcr_used, trend, ema_signal_choice)
     
-    st.write(f"**Used PCR**: {pcr_used:.2f} ({'Near Expiry' if use_near_pcr else 'Total OI'})")
-    st.write(f"**Trend**: {trend}")
-
     if signal == "BUY":
         st.success(f"Signal: {signal} ({suggested_side}) - At-The-Money option suggested: ₹{round(info['underlying']/100)*100} CE")
     elif signal == "SELL":
@@ -165,16 +178,20 @@ def display_dashboard():
         
     st.divider()
     
-    st.write(f"Last updated: {st.session_state.last_update}")
-    st.write("Data source: NSE India")
+    st.write(f"Data source: NSE India | Last updated: {st.session_state.last_update}")
     st.warning("Disclaimer: This is for educational purposes only. Do not use for live trading.")
 
 def fetch_data():
     """Fetches data and updates the session state."""
     st.session_state.loading = True
     try:
-        data = fetch_option_chain(st.session_state.symbol)
-        st.session_state.info = compute_oi_pcr_and_underlying(data)
+        option_chain_data = fetch_data_from_url(f"https://www.nseindia.com/api/option-chain-indices?symbol={st.session_state.symbol}")
+        vix_data = fetch_india_vix()
+        
+        info = compute_oi_pcr_and_underlying(option_chain_data)
+        info['vix'] = vix_data
+        
+        st.session_state.info = info
         st.session_state.last_update = time.strftime("%Y-%m-%d %H:%M:%S")
         st.session_state.error = None
     except Exception as e:
@@ -207,8 +224,7 @@ def main():
 
     st.title("NSE Option Chain Analysis Dashboard")
     st.markdown("This dashboard provides live analysis of NIFTY and BANKNIFTY based on a custom trading strategy.")
-
-    # Sidebar for symbol selection
+    
     st.sidebar.header("Settings")
     symbol_choice = st.sidebar.radio(
         "Select Symbol",
@@ -217,20 +233,15 @@ def main():
         key='symbol_radio'
     )
     
-    # Update symbol in session state if the radio button changes
     if symbol_choice != st.session_state.symbol:
         st.session_state.symbol = symbol_choice
-        # Trigger a data fetch when the symbol changes
         fetch_data()
         st.rerun()
 
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        if st.button("Refresh Data", use_container_width=True):
-            fetch_data()
-            st.rerun()
+    if st.sidebar.button("Refresh Data", use_container_width=True):
+        fetch_data()
+        st.rerun()
 
-    # Display content based on app state
     if st.session_state.loading:
         st.info(f"Fetching live data for {st.session_state.symbol}... Please wait.")
     elif st.session_state.error:
