@@ -1,4 +1,4 @@
-# app.py — Single-file Streamlit Paper Trading App with Market-Hour Guard (UTC→IST Safe)
+# app.py — Single-file Streamlit Paper Trading App with IST Market-Hours Guard + IST Timestamps
 
 import os
 import time
@@ -16,7 +16,6 @@ import streamlit as st
 STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "100000"))
 SIM_START_PRICE = float(os.getenv("SIM_START_PRICE", "997.28"))
 SIM_TICK_MS = int(os.getenv("SIM_TICK_MS", "1500"))
-NSE_CACHE_TTL = int(os.getenv("NSE_CACHE_TTL", "15"))
 DB_PATH = os.getenv("DB_PATH", "paper_trading.db")
 
 st.set_page_config(page_title="Paper Trading App", layout="wide")
@@ -94,7 +93,7 @@ def fetch_history(uid, limit=200):
 # ----------------------------
 def is_market_open():
     now_utc = datetime.utcnow()
-    now_ist = now_utc + timedelta(hours=5, minutes=30)  # Convert UTC → IST
+    now_ist = now_utc + timedelta(hours=5, minutes=30)
     return dtime(9, 0) <= now_ist.time() <= dtime(15, 30)
 
 # ----------------------------
@@ -183,24 +182,37 @@ with col2:
             update_balance(st.session_state.uid, bal - qty_in * last_price)
             st.success(f"BUY {qty_in} @ {last_price}")
         else:
-            st.warning("⏰ Market is closed. Trades allowed only between 9:00 AM and 3:30 PM IST.")
+            st.warning("⏰ Market closed. Trades allowed only 9:00 AM – 3:30 PM IST.")
     if st.button("SELL"):
         if is_market_open():
             insert_trade(st.session_state.uid, "SELL", qty_in, last_price)
             update_balance(st.session_state.uid, bal + qty_in * last_price)
             st.success(f"SELL {qty_in} @ {last_price}")
         else:
-            st.warning("⏰ Market is closed. Trades allowed only between 9:00 AM and 3:30 PM IST.")
+            st.warning("⏰ Market closed. Trades allowed only 9:00 AM – 3:30 PM IST.")
 
 # ----------------------------
-# Trade log
+# Trade log (IST display + current time)
 # ----------------------------
 st.subheader("Trade History")
+
+now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+st.caption(f"🕒 Current IST: {now_ist:%Y-%m-%d %H:%M:%S} • Market open: {is_market_open()}")
+
+def ts_to_ist_str(ts_seconds: int) -> str:
+    return (datetime.utcfromtimestamp(ts_seconds) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+
 history = fetch_history(st.session_state.uid)
 if history:
-    import pandas as pd
-    df = pd.DataFrame(history)
-    df["ts"] = pd.to_datetime(df["ts"], unit="s")
-    st.dataframe(df)
+    display_rows = []
+    for r in history:
+        display_rows.append({
+            "id": r["id"],
+            "side": r["side"],
+            "qty": r["qty"],
+            "price": r["price"],
+            "ts (IST)": ts_to_ist_str(r["ts"])
+        })
+    st.dataframe(display_rows, use_container_width=True)
 else:
     st.info("No trades yet.")
