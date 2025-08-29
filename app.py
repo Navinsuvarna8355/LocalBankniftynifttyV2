@@ -93,7 +93,7 @@ def fetch_history(uid, limit=200):
 # Market-hour guard
 # ----------------------------
 def is_market_open():
-    now_ist = datetime.now()  # Assumes server is in IST
+    now_ist = datetime.now()  # assumes server runs IST
     return dtime(9, 0) <= now_ist.time() <= dtime(15, 30)
 
 # ----------------------------
@@ -118,47 +118,6 @@ def step_price():
     if len(st.session_state.price_series) > 120:
         st.session_state.price_series = st.session_state.price_series[-120:]
     return st.session_state.last_price
-
-# ----------------------------
-# NSE Option Chain
-# ----------------------------
-@st.cache_data(ttl=NSE_CACHE_TTL)
-def get_option_chain(symbol="NIFTY", is_index=True):
-    base_url = "https://www.nseindia.com"
-    api_url = f"{base_url}/api/option-chain-{'indices' if is_index else 'equities'}?symbol={symbol.upper()}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.nseindia.com/option-chain"
-    }
-    s = requests.Session()
-    s.get(f"{base_url}/option-chain", headers=headers, timeout=10)
-    r = s.get(api_url, headers=headers, timeout=10)
-    raw = r.json()
-    expiry_dates = raw.get("records", {}).get("expiryDates", [])
-    if not expiry_dates:
-        return {"symbol": symbol.upper(), "expiry": None, "strikes": []}
-    current_expiry = expiry_dates[0]
-    strikes = []
-    for item in raw.get("records", {}).get("data", []):
-        if item.get("expiryDate") == current_expiry:
-            sp = item.get("strikePrice")
-            ce = item.get("CE") or {}
-            pe = item.get("PE") or {}
-            strikes.append({"strike": sp,
-                            "ce_oi": ce.get("openInterest", 0) or 0,
-                            "pe_oi": pe.get("openInterest", 0) or 0})
-    strikes.sort(key=lambda x: (x["strike"] is None, x["strike"]))
-    return {"symbol": symbol.upper(), "expiry": current_expiry, "strikes": strikes}
-
-def is_index_symbol(sym):
-    return sym.upper() in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
-
-def inr(x):
-    try:
-        return f"₹ {float(x):,.2f}"
-    except:
-        return f"₹ {x}"
 
 # ----------------------------
 # UI
@@ -193,9 +152,9 @@ pv = bal + qty * last_price
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("User ID", st.session_state.uid[-12:])
-m2.metric("Balance", inr(bal))
+m2.metric("Balance", f"₹ {bal:,.2f}")
 m3.metric("Shares held", f"{qty}")
-m4.metric("Portfolio value", inr(pv))
+m4.metric("Portfolio value", f"₹ {pv:,.2f}")
 
 st.subheader("Price chart")
 if st.session_state.price_series:
@@ -213,4 +172,28 @@ with col1:
 with col2:
     if st.button("BUY"):
         if is_market_open():
-            insert_trade(st.session_state.uid, "BUY", qty_in, last
+            insert_trade(st.session_state.uid, "BUY", qty_in, last_price)
+            update_balance(st.session_state.uid, bal - qty_in * last_price)
+            st.success(f"BUY {qty_in} @ {last_price}")
+        else:
+            st.warning("⏰ Market is closed. Allowed only between 9:00 AM and 3:30 PM IST.")
+    if st.button("SELL"):
+        if is_market_open():
+            insert_trade(st.session_state.uid, "SELL", qty_in, last_price)
+            update_balance(st.session_state.uid, bal + qty_in * last_price)
+            st.success(f"SELL {qty_in} @ {last_price}")
+        else:
+            st.warning("⏰ Market is closed. Allowed only between 9:00 AM and 3:30 PM IST.")
+
+# ----------------------------
+# Trade log table
+# ----------------------------
+st.subheader("Trade History")
+history = fetch_history(st.session_state.uid)
+if history:
+    import pandas as pd
+    df = pd.DataFrame(history)
+    df["ts"] = pd.to_datetime(df["ts"], unit="s")
+    st.dataframe(df)
+else:
+    st.info("No trades yet.")
