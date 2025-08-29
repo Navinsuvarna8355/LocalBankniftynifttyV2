@@ -1,4 +1,4 @@
-# app.py — Single-file Streamlit Paper Trading App with Market-Hour Guard
+# app.py — Single-file Streamlit Paper Trading App with Market-Hour Guard (UTC→IST Safe)
 
 import os
 import time
@@ -6,7 +6,7 @@ import uuid
 import random
 import sqlite3
 import threading
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 import requests
 import streamlit as st
 
@@ -90,10 +90,11 @@ def fetch_history(uid, limit=200):
     return [dict(r) for r in rows]
 
 # ----------------------------
-# Market-hour guard
+# Market-hour guard (UTC→IST)
 # ----------------------------
 def is_market_open():
-    now_ist = datetime.now()  # assumes server runs IST
+    now_utc = datetime.utcnow()
+    now_ist = now_utc + timedelta(hours=5, minutes=30)  # Convert UTC → IST
     return dtime(9, 0) <= now_ist.time() <= dtime(15, 30)
 
 # ----------------------------
@@ -119,10 +120,16 @@ def step_price():
         st.session_state.price_series = st.session_state.price_series[-120:]
     return st.session_state.last_price
 
+def inr(x):
+    try:
+        return f"₹ {float(x):,.2f}"
+    except:
+        return f"₹ {x}"
+
 # ----------------------------
 # UI
 # ----------------------------
-st.title("📈 Paper Trading App (Market Hours Guard)")
+st.title("📈 Paper Trading App (IST Market-Hours Guard)")
 
 if "uid" not in st.session_state:
     st.session_state.uid = str(uuid.uuid4())
@@ -152,9 +159,9 @@ pv = bal + qty * last_price
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("User ID", st.session_state.uid[-12:])
-m2.metric("Balance", f"₹ {bal:,.2f}")
+m2.metric("Balance", inr(bal))
 m3.metric("Shares held", f"{qty}")
-m4.metric("Portfolio value", f"₹ {pv:,.2f}")
+m4.metric("Portfolio value", inr(pv))
 
 st.subheader("Price chart")
 if st.session_state.price_series:
@@ -166,7 +173,7 @@ else:
 # Trading panel with guard
 # ----------------------------
 st.subheader("Trade")
-col1, col2, col3 = st.columns([1, 1, 6])
+col1, col2 = st.columns([1, 1])
 with col1:
     qty_in = st.number_input("Qty", min_value=1, value=1, step=1)
 with col2:
@@ -176,17 +183,17 @@ with col2:
             update_balance(st.session_state.uid, bal - qty_in * last_price)
             st.success(f"BUY {qty_in} @ {last_price}")
         else:
-            st.warning("⏰ Market is closed. Allowed only between 9:00 AM and 3:30 PM IST.")
+            st.warning("⏰ Market is closed. Trades allowed only between 9:00 AM and 3:30 PM IST.")
     if st.button("SELL"):
         if is_market_open():
             insert_trade(st.session_state.uid, "SELL", qty_in, last_price)
             update_balance(st.session_state.uid, bal + qty_in * last_price)
             st.success(f"SELL {qty_in} @ {last_price}")
         else:
-            st.warning("⏰ Market is closed. Allowed only between 9:00 AM and 3:30 PM IST.")
+            st.warning("⏰ Market is closed. Trades allowed only between 9:00 AM and 3:30 PM IST.")
 
 # ----------------------------
-# Trade log table
+# Trade log
 # ----------------------------
 st.subheader("Trade History")
 history = fetch_history(st.session_state.uid)
