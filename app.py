@@ -9,10 +9,10 @@ import math
 logging.basicConfig(level=logging.INFO)
 
 # --- Web Scraping and Calculation Functions ---
-def fetch_option_chain(symbol='BANKNIFTY', max_retries=3, delay=5):
+def fetch_option_chain(symbol='BANKNIFTY', max_retries=5, delay=5):
     """
-    Fetches live option chain data from NSE with improved headers and a retry mechanism
-    that first establishes a session.
+    Fetches live option chain data from NSE using a requests.Session to maintain state
+    and bypass security measures.
     
     Args:
         symbol (str): The stock index symbol (e.g., 'BANKNIFTY').
@@ -37,11 +37,13 @@ def fetch_option_chain(symbol='BANKNIFTY', max_retries=3, delay=5):
     
     for attempt in range(max_retries):
         try:
-            # Step 1: Establish a session and get cookies from the home page
-            logging.info(f"Attempt {attempt + 1}: Establishing session with NSE...")
+            # Step 1: Establish a session and get cookies from the home page.
+            # This is a crucial step to mimic a real user and get valid cookies.
+            logging.info(f"Attempt {attempt + 1}: Establishing session with NSE home page...")
             session.get("https://www.nseindia.com", timeout=10)
             
-            # Step 2: Use the same session to fetch the option chain data
+            # Step 2: Use the same session to fetch the option chain data.
+            # The session automatically sends the cookies it just received.
             logging.info(f"Attempt {attempt + 1}: Fetching option chain for {symbol}...")
             response = session.get(url, timeout=10)
             response.raise_for_status()  # Raise exception for bad status codes
