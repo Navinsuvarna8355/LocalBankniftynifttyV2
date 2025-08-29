@@ -163,7 +163,7 @@ const App = () => {
               ? (currentData.underlying - log.entryPrice) * 1
               : (log.entryPrice - currentData.underlying) * 1;
             
-            console.log(`Trade for ${symbol} closed. Final P&L: ₹${finalPnl.toFixed(2)}`);
+            console.log(`Trade for ${symbol} closed. Final P&L: Rs.${finalPnl.toFixed(2)}`);
             
             return {
               ...log,
@@ -294,7 +294,7 @@ const App = () => {
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
               <div className="bg-gray-800 rounded-lg p-4 text-center shadow-lg border-t-4 border-indigo-600">
                 <p className="text-gray-400 text-sm mb-1">Live Price</p>
-                <p className="text-xl sm:text-2xl font-bold text-green-400">₹ {data.underlying.toFixed(2)}</p>
+                <p className="text-xl sm:text-2xl font-bold text-green-400">Rs. {data.underlying.toFixed(2)}</p>
               </div>
               <div className="bg-gray-800 rounded-lg p-4 text-center shadow-lg border-t-4 border-yellow-400">
                 <p className="text-gray-400 text-sm mb-1">Total PCR</p>
@@ -373,10 +373,10 @@ const App = () => {
                       <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-300">{trade.timestamp}</td>
                       <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-300">{trade.symbol}</td>
                       <td className="px-4 py-2 whitespace-nowrap text-sm font-semibold text-center">{trade.signal === 'BUY' ? 'BUY CE' : 'SELL PE'}</td>
-                      <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-300">₹{trade.entryPrice.toFixed(2)}</td>
+                      <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-300">Rs.{trade.entryPrice.toFixed(2)}</td>
                       <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-300">{trade.exitTime || '-'}</td>
                       <td className={`px-4 py-2 whitespace-nowrap text-sm font-bold ${trade.status === 'Closed' && trade.finalPnl > 0 ? 'text-green-400' : trade.status === 'Closed' && trade.finalPnl < 0 ? 'text-red-400' : trade.pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {trade.status === 'Closed' ? `₹${trade.finalPnl}` : `₹${trade.pnl}`}
+                        {trade.status === 'Closed' ? `Rs.${trade.finalPnl}` : `Rs.${trade.pnl}`}
                       </td>
                       <td className="px-4 py-2 whitespace-nowrap text-sm text-center">
                         {trade.status === 'Active' ? <CheckIcon className="h-5 w-5 text-green-500 inline-block" /> : <XMarkIcon className="h-5 w-5 text-red-500 inline-block" />}
