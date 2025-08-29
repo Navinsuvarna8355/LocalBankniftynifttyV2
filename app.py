@@ -1,137 +1,210 @@
-import streamlit as st
-import requests
-import pandas as pd
+# app.py — Single-file Streamlit Paper Trading App
+# Features:
+# - Simulated price feed (random walk)
+# - Buy/Sell with balance, portfolio value, and transaction history (SQLite)
+# - NSE Option Chain fetch with headers + cookie warm-up, cached
+# - Per-user via User ID field; SQLite persistence
+# - Minimal deps: streamlit, requests (sqlite3 in stdlib)
+
+import os
+import time
+import uuid
 import json
+import random
+import sqlite3
+import threading
+from datetime import datetime
+import requests
+import streamlit as st
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="NSE Live Market Tracker",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+# ----------------------------
+# Config
+# ----------------------------
+STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "100000"))
+SIM_START_PRICE = float(os.getenv("SIM_START_PRICE", "997.28"))
+SIM_TICK_MS = int(os.getenv("SIM_TICK_MS", "1500"))
+NSE_CACHE_TTL = int(os.getenv("NSE_CACHE_TTL", "15"))
+DB_PATH = os.getenv("DB_PATH", "paper_trading.db")
 
-st.title("📈 NSE Live Market Tracker")
-st.markdown("---")
+st.set_page_config(page_title="Paper Trading App", layout="wide")
 
-# --- Function to fetch data from NSE using a robust method ---
-@st.cache_data(ttl=60)  # Cache data for 60 seconds
-def fetch_data(symbol):
-    """
-    Fetches live market data for a given symbol from NSE.
-    This function uses a session and robust headers to mimic a browser
-    request, which helps bypass security blocks.
-    """
-    st.info(f"Fetching data for {symbol}...")
+# ----------------------------
+# DB connection + init
+# ----------------------------
+db_lock = threading.Lock()
 
-    # Headers to mimic a browser request
+@st.cache_resource
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    with conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            balance REAL NOT NULL,
+            created_at INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            side TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
+            qty INTEGER NOT NULL CHECK (qty > 0),
+            price REAL NOT NULL,
+            ts INTEGER NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user ON trades(user_id)")
+    return conn
+
+conn = get_db()
+
+def ensure_user(uid, starting_balance=STARTING_BALANCE):
+    with db_lock:
+        r = conn.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
+        if not r:
+            conn.execute("INSERT INTO users VALUES (?,?,?)", (uid, float(starting_balance), int(time.time())))
+            conn.commit()
+
+def get_balance(uid):
+    r = conn.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+    return float(r["balance"]) if r else 0.0
+
+def get_net_qty(uid):
+    r = conn.execute("""SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN qty ELSE -qty END),0) AS net_qty
+                        FROM trades WHERE user_id=?""", (uid,)).fetchone()
+    return int(r["net_qty"] if r and r["net_qty"] is not None else 0)
+
+def insert_trade(uid, side, qty, price):
+    with db_lock:
+        conn.execute("INSERT INTO trades (user_id, side, qty, price, ts) VALUES (?,?,?,?,?)",
+                     (uid, side, qty, price, int(time.time())))
+        conn.commit()
+
+def update_balance(uid, new_balance):
+    with db_lock:
+        conn.execute("UPDATE users SET balance=? WHERE user_id=?", (float(new_balance), uid))
+        conn.commit()
+
+def reset_account(uid, starting_balance=STARTING_BALANCE):
+    with db_lock:
+        conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
+        conn.execute("UPDATE users SET balance=? WHERE user_id=?", (float(starting_balance), uid))
+        conn.commit()
+
+def fetch_history(uid, limit=200):
+    rows = conn.execute("SELECT id, side, qty, price, ts FROM trades WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                        (uid, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+# ----------------------------
+# Simulated price
+# ----------------------------
+def step_price():
+    now_ms = int(time.time() * 1000)
+    last_price = st.session_state.get("last_price", SIM_START_PRICE)
+    last_ts = st.session_state.get("last_ts", now_ms)
+    if now_ms - last_ts >= SIM_TICK_MS:
+        drift = -0.02 * (last_price - SIM_START_PRICE) / SIM_START_PRICE
+        shock = random.uniform(-0.20, 0.20)
+        new_p = max(1.0, round(last_price * (1 + drift*0.01 + shock*0.001), 2))
+        st.session_state.last_price = new_p
+        st.session_state.last_ts = now_ms
+    else:
+        st.session_state.last_price = last_price
+        st.session_state.last_ts = last_ts
+    if "price_series" not in st.session_state:
+        st.session_state.price_series = []
+    st.session_state.price_series.append((now_ms, st.session_state.last_price))
+    if len(st.session_state.price_series) > 120:
+        st.session_state.price_series = st.session_state.price_series[-120:]
+    return st.session_state.last_price
+
+# ----------------------------
+# NSE Option Chain
+# ----------------------------
+@st.cache_data(ttl=NSE_CACHE_TTL)
+def get_option_chain(symbol="NIFTY", is_index=True):
+    base_url = "https://www.nseindia.com"
+    api_url = f"{base_url}/api/option-chain-{'indices' if is_index else 'equities'}?symbol={symbol.upper()}"
     headers = {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'referer': 'https://www.nseindia.com/option-chain',
-        'accept-language': 'en-US,en;q=0.9',
-        'accept-encoding': 'gzip, deflate, br',
-        'host': 'www.nseindia.com'
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.nseindia.com/option-chain"
     }
+    s = requests.Session()
+    s.get(f"{base_url}/option-chain", headers=headers, timeout=10)
+    r = s.get(api_url, headers=headers, timeout=10)
+    raw = r.json()
+    expiry_dates = raw.get("records", {}).get("expiryDates", [])
+    if not expiry_dates:
+        return {"symbol": symbol.upper(), "expiry": None, "strikes": []}
+    current_expiry = expiry_dates[0]
+    strikes = []
+    for item in raw.get("records", {}).get("data", []):
+        if item.get("expiryDate") == current_expiry:
+            sp = item.get("strikePrice")
+            ce = item.get("CE") or {}
+            pe = item.get("PE") or {}
+            strikes.append({"strike": sp,
+                            "ce_oi": ce.get("openInterest", 0) or 0,
+                            "pe_oi": pe.get("openInterest", 0) or 0})
+    strikes.sort(key=lambda x: (x["strike"] is None, x["strike"]))
+    return {"symbol": symbol.upper(), "expiry": current_expiry, "strikes": strikes}
 
+def is_index_symbol(sym):
+    return sym.upper() in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
+
+def inr(x):
     try:
-        # Step 1: Get cookies from the main NSE site to initiate a valid session
-        session = requests.Session()
-        session.get('https://www.nseindia.com/', headers=headers)
-        
-        # Step 2: Use the session and headers to fetch the actual data
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        response = session.get(url, headers=headers)
-        
-        # Check for successful response
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        st.success("Data fetched successfully!")
-        return data
-    
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error fetching data: {e}")
-        st.error("NSE website might be blocking the request. Please try again after a few minutes.")
-        return None
-    except json.JSONDecodeError:
-        st.error("Failed to decode JSON. The received data might be in an incorrect format.")
-        return None
+        return f"₹ {float(x):,.2f}"
+    except:
+        return f"₹ {x}"
 
+# ----------------------------
+# UI
+# ----------------------------
+st.title("📈 Paper Trading App")
 
-# --- Displaying Data ---
-def display_data(symbol):
-    data = fetch_data(symbol)
-    if data:
-        try:
-            records = data.get('records', {})
-            timestamp = records.get('timestamp')
-            st.markdown(f"**Last Updated:** {timestamp}")
-            st.markdown("---")
+# Session user id default
+if "uid" not in st.session_state:
+    st.session_state.uid = str(uuid.uuid4())
 
-            # Extract CE and PE data
-            calls = pd.DataFrame(records['CE'])
-            puts = pd.DataFrame(records['PE'])
+with st.sidebar:
+    st.markdown("### User & settings")
+    uid_input = st.text_input("User ID", st.session_state.uid)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Load/Create user"):
+            st.session_state.uid = uid_input.strip() or st.session_state.uid
+            ensure_user(st.session_state.uid, STARTING_BALANCE)
+            st.success(f"Active user: {st.session_state.uid}")
+    with col_b:
+        if st.button("Reset account"):
+            ensure_user(st.session_state.uid, STARTING_BALANCE)
+            reset_account(st.session_state.uid, STARTING_BALANCE)
+            st.session_state.last_price = SIM_START_PRICE
+            st.session_state.price_series = []
+            st.toast("Account reset.")
 
-            # Add more descriptive columns for better readability
-            # Call Options
-            st.header(f"Call Options ({symbol})")
-            ce_display = calls[[
-                'strikePrice',
-                'changeinOpenInterest',
-                'pChangeinOpenInterest',
-                'openInterest',
-                'pchange',
-                'lastPrice',
-                'totalTradedVolume',
-                'impliedVolatility'
-            ]].rename(columns={
-                'strikePrice': 'Strike Price',
-                'changeinOpenInterest': 'Change in OI',
-                'pChangeinOpenInterest': '% Change in OI',
-                'openInterest': 'OI',
-                'pchange': '% Change',
-                'lastPrice': 'Last Price',
-                'totalTradedVolume': 'Volume',
-                'impliedVolatility': 'Implied Volatility (IV)'
-            })
-            st.dataframe(ce_display, use_container_width=True)
+ensure_user(st.session_state.uid, STARTING_BALANCE)
 
-            # Put Options
-            st.header(f"Put Options ({symbol})")
-            pe_display = puts[[
-                'strikePrice',
-                'changeinOpenInterest',
-                'pChangeinOpenInterest',
-                'openInterest',
-                'pchange',
-                'lastPrice',
-                'totalTradedVolume',
-                'impliedVolatility'
-            ]].rename(columns={
-                'strikePrice': 'Strike Price',
-                'changeinOpenInterest': 'Change in OI',
-                'pChangeinOpenInterest': '% Change in OI',
-                'openInterest': 'OI',
-                'pchange': '% Change',
-                'lastPrice': 'Last Price',
-                'totalTradedVolume': 'Volume',
-                'impliedVolatility': 'Implied Volatility (IV)'
-            })
-            st.dataframe(pe_display, use_container_width=True)
+# Price & portfolio metrics
+last_price = step_price()
+qty, bal, pv = get_net_qty(st.session_state.uid), get_balance(st.session_state.uid), get_balance(st.session_state.uid) + get_net_qty(st.session_state.uid) * last_price
 
-        except Exception as e:
-            st.error(f"An error occurred while displaying data: {e}")
-            st.info("The data structure might have changed. Please try refreshing the page.")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("User ID", st.session_state.uid[-12:])
+m2.metric("Balance", inr(bal))
+m3.metric("Shares held", f"{qty}")
+m4.metric("Portfolio value", inr(pv))
 
-# --- Main App Logic ---
-if __name__ == "__main__":
-    st.sidebar.header("Options")
-    selected_symbol = st.sidebar.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIF"])
-    
-    st.subheader(f"Option Chain for {selected_symbol}")
-    display_data(selected_symbol)
-    
-    # Refresh button
-    if st.button("Refresh Data", key="refresh_button"):
-        st.rerun()
+# Price chart
+st.subheader("Price chart")
+if st.session_state.price_series:
+    st.line_chart({"Price": [p for _, p in st.session_state.price_series]}, height=180)
+else:
+    st.info("Starting price stream…")
+
+# Trade panel
+st.subheader("Trade")
+col1, col2, col3 = st.columns([1, 1, 6])
+with col1:
+    qty_in = st
